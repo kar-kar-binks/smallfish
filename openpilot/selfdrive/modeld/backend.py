@@ -207,19 +207,7 @@ class CustomModelState:
                      if pred_speed_wps is not None else np.full(len(waypoints), v_ego, dtype=np.float32))
     return waypoints, speed_profile
 
-  def run(self, bufs, transforms, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray] | None:
-    stride, y_height, _, _ = self.frame_buf_params["img"]
-    rgb = _nv12_to_rgb(bufs["img"], self.cam_w, self.cam_h, stride, y_height)
-    v_ego = float(inputs.get("v_ego", 0.0))
-
-    ego_lla = inputs.get("ego_lla")
-    ego_yaw_ned = inputs.get("ego_yaw_ned")
-    route_lla = inputs.get("route_lla", [])
-    if ego_lla is not None and ego_yaw_ned is not None:
-      target_point_xy = self._target_point(ego_lla, float(ego_yaw_ned), route_lla)
-    else:
-      target_point_xy = np.array([[TARGET_POINT_LOOKAHEAD_M, 0.0], [TARGET_POINT_LOOKAHEAD2_M, 0.0]], dtype=np.float32)
-
+  def _plan_from_frame(self, rgb: np.ndarray, v_ego: float, target_point_xy: np.ndarray) -> dict | None:
     result = self._infer(rgb, v_ego, target_point_xy)
     if result is None:
       return None
@@ -235,15 +223,41 @@ class CustomModelState:
     z = np.zeros_like(x)
     a = np.gradient(v, t_dst)
 
+    kappa_v2 = float(2.0 * y[4] / max(t_dst[4], 1e-3) ** 2) if len(y) > 4 else 0.0
+    accel = float(a[2]) if len(a) > 2 else 0.0
+    should_stop = bool(v[-1] < 0.3 and v_ego < 1.0)
+
+    return {"t": t_dst, "x": x, "y": y, "z": z, "v": v, "a": a,
+            "kappa_v2": kappa_v2, "accel": accel, "should_stop": should_stop}
+
+  def run(self, bufs, transforms, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray] | None:
+    stride, y_height, _, _ = self.frame_buf_params["img"]
+    rgb = _nv12_to_rgb(bufs["img"], self.cam_w, self.cam_h, stride, y_height)
+    v_ego = float(inputs.get("v_ego", 0.0))
+
+    ego_lla = inputs.get("ego_lla")
+    ego_yaw_ned = inputs.get("ego_yaw_ned")
+    route_lla = inputs.get("route_lla", [])
+    if ego_lla is not None and ego_yaw_ned is not None:
+      target_point_xy = self._target_point(ego_lla, float(ego_yaw_ned), route_lla)
+    else:
+      target_point_xy = np.array([[TARGET_POINT_LOOKAHEAD_M, 0.0], [TARGET_POINT_LOOKAHEAD2_M, 0.0]], dtype=np.float32)
+
+    plan_result = self._plan_from_frame(rgb, v_ego, target_point_xy)
+    if plan_result is None:
+      return None
+    x, y, z, v, a = plan_result["x"], plan_result["y"], plan_result["z"], plan_result["v"], plan_result["a"]
+    t_dst = plan_result["t"]
+
     plan = np.zeros((1, ModelConstants.IDX_N, ModelConstants.PLAN_WIDTH), dtype=np.float32)
     plan[0, :, 0], plan[0, :, 1], plan[0, :, 2] = x, y, z
     plan[0, :, 3] = v
     plan[0, :, 6] = a
     plan_stds = np.ones_like(plan) * 0.5
 
-    kappa_v2 = float(2.0 * y[4] / max(t_dst[4], 1e-3) ** 2) if len(y) > 4 else 0.0
-    accel = float(a[2]) if len(a) > 2 else 0.0
-    should_stop = bool(v[-1] < 0.3 and v_ego < 1.0)
+    kappa_v2 = plan_result["kappa_v2"]
+    accel = plan_result["accel"]
+    should_stop = plan_result["should_stop"]
     action = np.array([[kappa_v2, accel]], dtype=np.float32)
 
     lane_lines = np.zeros((1, ModelConstants.NUM_LANE_LINES, ModelConstants.IDX_N, ModelConstants.LANE_LINES_WIDTH), dtype=np.float32)
