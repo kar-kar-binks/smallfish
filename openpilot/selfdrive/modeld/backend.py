@@ -56,7 +56,15 @@ class CustomModelState:
     self.build_transform = build_transform
     self.dynamic_preprocess = dynamic_preprocess
 
-    self.device = torch.device("cuda")
+    if torch.cuda.is_available():
+      self.device = torch.device("cuda")
+      self.dtype = torch.bfloat16
+    elif torch.backends.mps.is_available():
+      self.device = torch.device("mps")
+      self.dtype = torch.float32
+    else:
+      self.device = torch.device("cpu")
+      self.dtype = torch.float32
     config_path = Path(MODEL_CHECKPOINT).parent.parent.parent / ".hydra" / "config.yaml"
     with open(config_path, "r") as f:
       cfg = OmegaConf.load(f)
@@ -72,7 +80,7 @@ class CustomModelState:
 
     cache_dir = f"pretrained/{cfg.model.vision_model.variant.split('/')[1]}"
     default_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_dtype(self.dtype)
     self.model = hydra.utils.instantiate(
         cfg.model, cfg_data_module=cfg.data_module, processor=processor,
         cache_dir=cache_dir, _recursive_=False).to(self.device)
@@ -183,7 +191,7 @@ class CustomModelState:
 
   def _infer(self, rgb: np.ndarray, v_ego: float, target_point_xy: np.ndarray):
     pixel_values, image_sizes = self._preprocess_image(rgb)
-    pixel_values = pixel_values.to(self.device, dtype=self.torch.bfloat16)
+    pixel_values = pixel_values.to(self.device, dtype=self.dtype)
 
     use_cot = bool(self.cfg.get("use_cot", False))
     language = self._build_prompt(v_ego, use_cot, target_point_xy)
