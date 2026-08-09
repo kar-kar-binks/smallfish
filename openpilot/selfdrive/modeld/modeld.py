@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from functools import cached_property
 import os
-os.environ['GMMU'] = '0' # for usbgpu fast loading, noop for qcom
+os.environ['GMMU'] = '0'
 from tinygrad.tensor import Tensor
 from tinygrad.device import Device
 import struct
@@ -27,7 +27,9 @@ from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, should_stop, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, WARP_INPUTS, POLICY_INPUTS
-from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
+from openpilot.selfdrive.modeld.fill_model_msg import fill_driving_model_data, fill_pose_msg, PublishState
+from openpilot.selfdrive.modeld.backend import CustomModelState
+from openpilot.selfdrive.modeld.fill_model_msg_custom import fill_model_msg_custom as fill_model_msg
 from openpilot.common.file_chunker import open_file_chunked
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_compiled, modeld_pkl_path, get_tg_input_devices, load_oob
@@ -70,7 +72,6 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
 
 
 class ChestnutState:
-  # only modeld can access chestnut
   def __init__(self, pm: PubMaster):
     self.pm = pm
     self.valid = True
@@ -101,7 +102,6 @@ class ChestnutState:
         if self.valid:
           cloudlog.exception("chestnut state read failed")
       try:
-        # ASM runs on USB-C power, these still read without a gpu
         asm = Device["AMD"].iface.pci_dev.usb
         state.pcieLtssm = asm.read(0xB450, 1)[0]
         state.supplyVoltage, state.supplyCurrent = struct.unpack('<Hh', bytes(asm.usb.control_read(0xC0, 5))[:4])
@@ -124,7 +124,7 @@ class FrameMeta:
 
 
 class ModelState:
-  prev_desire: np.ndarray  # for tracking the rising edge of the pulse
+  prev_desire: np.ndarray
 
   def __init__(self, cam_w: int, cam_h: int, usbgpu: bool):
     input_devices = get_tg_input_devices(PROCESS_NAME, usbgpu)
@@ -156,13 +156,11 @@ class ModelState:
     for key in bufs.keys():
       ptr = np.frombuffer(bufs[key].data, dtype=np.uint8).ctypes.data
       yuv_size = self.frame_buf_params[key][3]
-      # There is a ringbuffer of imgs, just cache tensors pointing to all of them
       cache_key = (key, ptr)
       if cache_key not in self._blob_cache:
         self._blob_cache[cache_key] = Tensor.from_blob(ptr, (yuv_size,), dtype='uint8', device=self.WARP_DEV)
       self.full_frames[key] = self._blob_cache[cache_key]
 
-    # Model decides when action is completed, so desire input is just a pulse triggered on rising edge
     inputs['desire_pulse'][0] = 0
     self.npy['desire'][:] = np.where(inputs['desire_pulse'] - self.prev_desire > .99, inputs['desire_pulse'], 0)
     self.prev_desire[:] = inputs['desire_pulse']
@@ -178,7 +176,6 @@ class ModelState:
     )
     model_output = outs.numpy()[0]
     if self.usbgpu and not np.all(np.isfinite(model_output)):
-      # TODO remove with prev_feat
       cloudlog.error("model output not finite, dropping frame")
       return None
     outputs_dict = self.parser.parse_outputs(self.slice_outputs(model_output, self.output_slices))
@@ -211,7 +208,6 @@ def main(demo=False):
 
   config_realtime_process(7, 54)
 
-  # visionipc clients
   while True:
     available_streams = VisionIpcClient.available_streams("camerad", block=False)
     if available_streams:
@@ -242,7 +238,7 @@ def main(demo=False):
     def load_big():
       nonlocal big_model
       try:
-        m = ModelState(vipc_client_main.width, vipc_client_main.height, True)
+        m = CustomModelState(vipc_client_main.width, vipc_client_main.height, True)
         m.warmup()
         big_model = m
       except Exception:
@@ -253,22 +249,21 @@ def main(demo=False):
     model = big_model
     params.put_bool("UsbGpuActive", model is not None)
 
-  small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if model is None or USBGPU else None
+  small_model = CustomModelState(vipc_client_main.width, vipc_client_main.height, False) if model is None or USBGPU else None
   if model is None:
     model = small_model
   params.put_bool("UsbGpuLoading", False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
-  # messaging
   pub_socks = ["modelV2", "drivingModelData", "cameraOdometry"] + (["chestnutState"] if USBGPU else [])
   pm = PubMaster(pub_socks)
-  sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay"])
+  sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "liveCalibration", "driverMonitoringState",
+                  "carControl", "liveDelay", "navRoute", "liveLocationKalman"])
 
   publish_state = PublishState()
   params = Params()
   chestnut_state = ChestnutState(pm) if USBGPU else None
 
-  # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_RUN_FREQ)
   frame_id = 0
   last_vipc_frame_id = 0
@@ -287,15 +282,12 @@ def main(demo=False):
     CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
   cloudlog.info("modeld got CarParams: %s", CP.brand)
 
-  # TODO this needs more thought, use .2s extra for now to estimate other delays
-  # TODO Move smooth seconds to action function
   long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
 
   while True:
-    # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
     while meta_main.timestamp_sof < meta_extra.timestamp_sof + 25000000:
       buf_main = vipc_client_main.recv()
       meta_main = FrameMeta(vipc_client_main)
@@ -307,7 +299,6 @@ def main(demo=False):
       continue
 
     if use_extra_client:
-      # Keep receiving extra frames until frame id matches main camera
       while True:
         buf_extra = vipc_client_extra.recv()
         meta_extra = FrameMeta(vipc_client_extra)
@@ -323,7 +314,6 @@ def main(demo=False):
                          extra: {meta_extra.frame_id} ({meta_extra.timestamp_sof / 1e9:.5f})")
 
     else:
-      # Use single camera
       buf_extra = buf_main
       meta_extra = meta_main
 
@@ -350,10 +340,9 @@ def main(demo=False):
     if desire >= 0 and desire < ModelConstants.DESIRE_LEN:
       vec_desire[desire] = 1
 
-    # tracked dropped frames
     vipc_dropped_frames = max(0, meta_main.frame_id - last_vipc_frame_id - 1)
     frames_dropped = frame_dropped_filter.update(min(vipc_dropped_frames, 10))
-    if run_count < 10: # let frame drops warm up
+    if run_count < 10:
       frame_dropped_filter.x = 0.
       frames_dropped = 0.
     run_count = run_count + 1
@@ -362,15 +351,21 @@ def main(demo=False):
 
     bufs = {name: buf_extra if 'big' in name else buf_main for name in model.vision_input_names}
     transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
-    frame_delay = DT_MDL # compensate for time passed since the frame was captured: current_time - timestamp_eof is 50ms on average
-    action_delay = DT_MDL / 2 # middle of the interval between model output (current state) and next frame (expected state)
+    frame_delay = DT_MDL
+    action_delay = DT_MDL / 2
     lat_action_t = lat_delay + frame_delay + action_delay
     long_action_t = long_delay + frame_delay + action_delay
     inputs: dict[str, np.ndarray] = {
       'desire_pulse': vec_desire,
       'traffic_convention': traffic_convention,
       'action_t': np.array([lat_action_t, long_action_t], dtype=np.float32),
+      'v_ego': v_ego,
     }
+    llk = sm['liveLocationKalman']
+    if llk.status == log.LiveLocationKalman.Status.valid and llk.positionGeodetic.valid:
+      inputs['ego_lla'] = np.array(llk.positionGeodetic.value, dtype=np.float64)
+      inputs['ego_yaw_ned'] = float(llk.calibratedOrientationNED.value[2]) if llk.calibratedOrientationNED.valid else 0.0
+      inputs['route_lla'] = [(c.latitude, c.longitude) for c in sm['navRoute'].coordinates]
 
     mt1 = time.perf_counter()
     try:
@@ -378,7 +373,6 @@ def main(demo=False):
     except Exception:
       if not params.get_bool("UsbGpuActive"):
         raise
-      # fallback to small model
       cloudlog.exception("big model failed, fall back to small")
       params.put_bool("UsbGpuActive", False)
       model = small_model
