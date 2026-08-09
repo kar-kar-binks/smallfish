@@ -97,3 +97,5 @@ build/
 .context/
 PLAN.md
 TASK.md
+
+third_party/simlingo_checkpoint/

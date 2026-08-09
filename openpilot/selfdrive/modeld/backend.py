@@ -48,8 +48,8 @@ class CustomModelState:
     from omegaconf import OmegaConf
     from pathlib import Path
     from transformers import AutoProcessor
-    from model_training.utils.custom_types import DrivingInput
-    from model_training.utils.internvl2_utils import build_transform, dynamic_preprocess
+    from simlingo_training.utils.custom_types import DrivingInput
+    from simlingo_training.utils.internvl2_utils import build_transform, dynamic_preprocess
 
     self.torch = torch
     self.DrivingInput = DrivingInput
@@ -101,7 +101,7 @@ class CustomModelState:
     patch_size = tmp_config.vision_config.patch_size
     self.num_image_token = int((image_size // patch_size) ** 2 * (tmp_config.downsample_ratio ** 2))
 
-    from model_utils import get_camera_intrinsics, get_camera_extrinsics
+    from team_code.simlingo_utils import get_camera_intrinsics, get_camera_extrinsics
     self._camera_intrinsics = get_camera_intrinsics(self.cam_w, self.cam_h, 110).unsqueeze(0).to(self.device)
     self._camera_extrinsics = get_camera_extrinsics().unsqueeze(0).to(self.device)
 
@@ -149,7 +149,7 @@ class CustomModelState:
     return pixel_values, image_sizes
 
   def _build_prompt(self, speed: float, use_cot: bool, target_point_xy: np.ndarray):
-    from model_training.utils.custom_types import LanguageLabel
+    from simlingo_training.utils.custom_types import LanguageLabel
 
     prompt_tp = "Target waypoint: <TARGET_POINT><TARGET_POINT>."
     tail = "What should the ego do next?" if use_cot else "Predict the waypoints."
